@@ -57,11 +57,16 @@ function_mapping = {
 
 logger.info("Function mappings have been initialized.")
 
-async def wait_on_run(client, thread_id, run_id, check_interval=4.5):
+async def wait_on_run(client, thread_id, run_id, check_interval=4.0):
     logger.info(f"Waiting on run {run_id} in thread {thread_id}")
     while True:
         await asyncio.sleep(check_interval)
-        run = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run_id)
+        loop = asyncio.get_running_loop()
+        
+        def retrieve_run_sync():
+            return client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run_id)
+        
+        run = await loop.run_in_executor(None, retrieve_run_sync)
         if run.status in ["requires_action", "completed"]:
             logger.info(f"Run {run_id} status: {run.status}")
             return run
@@ -73,7 +78,7 @@ class HeliusChatBot(commands.Cog):
         self.user_threads = {}  # User-specific threads
         self.last_bot_message_id = {}  # Track last message IDs per user
         self.helius_assistant_id = ASSISTANT_ID
-        self.allowed_channel_ids = [1209270991948349461, 1137349870194270270, 1101204273339056139]  # Customize as needed
+        self.allowed_channel_ids = [1209270991948349461, 1101204273339056139, 1137349870194270270]  # REPLACE WITH YOUR OWN SERVER CHANNELS
         self.message_queues = {}  # Queue for managing messages per thread
         logger.info("HeliusChatBot cog initialized.")
 
@@ -124,22 +129,32 @@ class HeliusChatBot(commands.Cog):
                     self.message_queues[thread_id].task_done()
 
     async def create_thread_for_user(self, user_id):
-        loop = asyncio.get_event_loop()
-        thread = await loop.run_in_executor(None, lambda: client.beta.threads.create())
-        self.user_threads[user_id] = thread.id
-        logger.info(f"New thread created for user {user_id}: {thread.id}")
-        # Upsert the thread ID into the database asynchronously
-        await upsert_user_thread(user_id, thread.id)
-        return thread.id
+        loop = asyncio.get_running_loop()
+        
+        def create_thread_sync():
+            return client.beta.threads.create().id
+        
+        thread_id = await loop.run_in_executor(None, create_thread_sync)
+        self.user_threads[user_id] = thread_id
+        logger.info(f"New thread created for user {user_id}: {thread_id}")
+        await upsert_user_thread(user_id, thread_id)
+        return thread_id
 
     async def process_user_message(self, user_id, thread_id, message):
-        loop = asyncio.get_event_loop()
-        # Add the user's message to the thread
-        await loop.run_in_executor(None, lambda: client.beta.threads.messages.create(thread_id=thread_id, role="user", content=message.content))
+        loop = asyncio.get_running_loop()
+    
+        # Synchronous wrapper for adding a message
+        def add_message_sync():
+            client.beta.threads.messages.create(thread_id=thread_id, role="user", content=message.content)
+        
+        # Synchronous wrapper for creating a run
+        def create_run_sync():
+            return client.beta.threads.runs.create(thread_id=thread_id, assistant_id=self.helius_assistant_id).id
+    
+        await loop.run_in_executor(None, add_message_sync)
         logger.info(f"Message from user {user_id} added to thread {thread_id}.")
     
-        # Create a new run for the current thread and wait for its completion
-        run_id = await loop.run_in_executor(None, lambda: client.beta.threads.runs.create(thread_id=thread_id, assistant_id=self.helius_assistant_id).id)
+        run_id = await loop.run_in_executor(None, create_run_sync)
         run = await wait_on_run(client, thread_id, run_id)
     
         # Check if the run requires action and process accordingly
@@ -189,20 +204,19 @@ class HeliusChatBot(commands.Cog):
             final_message = await self.get_final_message_from_thread(thread_id)
             await self.send_final_message(user_id, message.channel, final_message)
 
-
     async def get_final_message_from_thread(self, thread_id):
-        loop = asyncio.get_event_loop()
-        # Retrieve all messages from the thread
-        messages = await loop.run_in_executor(None, lambda: client.beta.threads.messages.list(thread_id=thread_id, order="desc", limit=1).data)
-        # Filter messages to only retrieve those sent by the assistant
-        assistant_messages = [msg for msg in messages if msg.role == "assistant"]
-        if assistant_messages:
-            # Assuming messages are structured with a content list and you're interested in the first item's text value
-            return assistant_messages[0].content[0].text.value if assistant_messages[0].content else "I've processed your request."
-        else:
-            return "I've processed your request, but I don't have anything more to say."
+        loop = asyncio.get_running_loop()
+    
+        def list_messages_sync():
+            return client.beta.threads.messages.list(thread_id=thread_id, order="desc", limit=1).data
+    
+        messages = await loop.run_in_executor(None, list_messages_sync)
+        if messages:
+            assistant_messages = [msg for msg in messages if msg.role == "assistant"]
+            if assistant_messages:
+                return assistant_messages[0].content[0].text.value if assistant_messages[0].content else "I've processed your request."
+        return "I've processed your request, but I don't have anything more to say."
 
-  
     async def send_final_message(self, user_id, channel, final_message):
         if len(final_message) > 2000:
             for part in [final_message[i:i+2000] for i in range(0, len(final_message), 2000)]:
